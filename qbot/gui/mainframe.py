@@ -10,6 +10,7 @@ from qbot.gui.panels.panel_trade import TradePanel
 from qbot.gui.panels.panel_zhiku import ZhikuPanel
 from qbot.gui.widgets.widget_web import WebPanel
 from qbot.version import version
+from qbot.common.temp_config import cleanup_temp_files
 
 # from qbot.gui.panels.panel_userframe import UserFrame
 # from qbot.gui.panels.actions import ActionsPanel
@@ -77,7 +78,8 @@ class MainFrame(wx.Frame):
 
     def on_params_conf(self, event):
         dialog = ParamsConfigDialog(self)
-        dialog.Show()
+        dialog.ShowModal()
+        dialog.Destroy()
 
     def OnAbout(self, event):
         wx.MessageBox(
@@ -149,3 +151,11 @@ class MainFrame(wx.Frame):
         self.tabs.AddPage(TradePanel(self.tabs), "在线交易(实盘/虚拟盘)", True)
 
         self.tabs.SetSelection(4)  # 可视化股票/基金回测系统 as hometab
+        
+        # 绑定关闭事件
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+    
+    def on_close(self, event):
+        """程序关闭时清理临时文件"""
+        cleanup_temp_files()
+        event.Skip()  # 继续关闭窗口

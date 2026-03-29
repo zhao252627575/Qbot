@@ -3,6 +3,7 @@
 
 import datetime
 import os
+import json
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,6 +12,16 @@ from functools import partial
 
 from qbot.gui.common.SysFile import Base_File_Oper
 from qbot.common.logging.logger import LOGGER as logger
+
+# 全局临时存储（程序关闭后丢失）
+_temp_storage = {
+    "tushare_api_key": None,
+    "mysql_config": None,
+    "csv_path": None
+}
+
+# 防止递归标志
+_processing_tushare = False
 
 QBOT_TOP_PATH = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -175,6 +186,62 @@ class UserDialog(wx.Dialog):  # user-defined
         self.log_tx_input.Clear()
         self.log_tx_input.AppendText(Base_File_Oper.read_log_trade())
 
+
+class PostgreSQLConfigDialog(wx.Dialog):
+    """PostgreSQL配置对话框"""
+    
+    def __init__(self, parent, id, title="PostgreSQL配置"):
+        wx.Dialog.__init__(self, parent, id, title, size=(400, 350))
+        
+        self.panel = wx.Panel(self)
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # 表单字段
+        fields = [
+            ("host", "服务器地址:", "localhost"),
+            ("port", "端口:", "5432"),
+            ("database", "数据库:", ""),
+            ("user", "用户名:", "postgres"),
+            ("password", "密码:", ""),
+            ("table", "表名:", "stock_data"),
+        ]
+        
+        self.inputs = {}
+        for field_id, label, default in fields:
+            row_sizer = wx.BoxSizer(wx.HORIZONTAL)
+            lbl = wx.StaticText(self.panel, label=label, size=(80, -1))
+            if field_id == "password":
+                txt = wx.TextCtrl(self.panel, value=default, style=wx.TE_PASSWORD, size=(250, -1))
+            else:
+                txt = wx.TextCtrl(self.panel, value=default, size=(250, -1))
+            row_sizer.Add(lbl, 0, wx.ALL | wx.CENTER, 5)
+            row_sizer.Add(txt, 0, wx.ALL, 5)
+            main_sizer.Add(row_sizer, 0, wx.EXPAND | wx.ALL, 2)
+            self.inputs[field_id] = txt
+        
+        # 按钮
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.ok_btn = wx.Button(self.panel, wx.ID_OK, "确定")
+        self.cancel_btn = wx.Button(self.panel, wx.ID_CANCEL, "取消")
+        btn_sizer.Add(self.ok_btn, 0, wx.ALL, 5)
+        btn_sizer.Add(self.cancel_btn, 0, wx.ALL, 5)
+        main_sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10)
+        
+        self.panel.SetSizer(main_sizer)
+        self.Centre()
+    
+    def get_config(self):
+        """获取配置字典"""
+        return {
+            "host": self.inputs["host"].GetValue().strip(),
+            "port": self.inputs["port"].GetValue().strip(),
+            "database": self.inputs["database"].GetValue().strip(),
+            "user": self.inputs["user"].GetValue().strip(),
+            "password": self.inputs["password"].GetValue(),
+            "table": self.inputs["table"].GetValue().strip(),
+        }
+
+
 class ParamsConfigDialog(wx.Dialog):
     def __init__(
         self, parent=None, title="参数配置", displaySize=(1440, 1120)
@@ -227,7 +294,7 @@ class ParamsConfigDialog(wx.Dialog):
         sys_input_sizer.Add(disp_size_text, 0, wx.EXPAND | wx.ALL | wx.CENTER, 2)
 
         # 初始化数据存储方式
-        data_store_list = ["本地csv", "Sqlite"]
+        data_store_list = ["本地csv", "postgresql"]
         self.data_store_box = wx.RadioBox(
             self.SysPanel,
             -1,
@@ -236,11 +303,15 @@ class ParamsConfigDialog(wx.Dialog):
             majorDimension=2,
             style=wx.RA_SPECIFY_COLS,
         )
+        # 绑定选择事件
+        self.data_store_box.Bind(wx.EVT_RADIOBOX, self._ev_on_data_store_change)
         # 初始化存储变量
         self.data_store_val = self.data_store_box.GetStringSelection()
+        # 加载已保存的配置
+        self.data_store_config = self.sys_para.get("data_store_config", {})
 
-        # 初始化数据源
-        data_src_list = ["tushare", "新浪爬虫", "baostock", "离线csv"]
+        # 初始化数据源 - 调整顺序，将离线csv放在第一位作为安全默认值
+        data_src_list = ["离线csv", "tushare", "新浪爬虫", "baostock"]
         self.data_src_box = wx.RadioBox(
             self.SysPanel,
             -1,
@@ -249,7 +320,10 @@ class ParamsConfigDialog(wx.Dialog):
             majorDimension=2,
             style=wx.RA_SPECIFY_ROWS,
         )
-        # 初始化指标变量
+        # 绑定选择事件
+        self.data_src_box.Bind(wx.EVT_RADIOBOX, self._ev_on_data_src_change)
+        # 默认选中离线csv（安全默认值），不默认选tushare
+        self.data_src_box.SetSelection(0)  # "离线csv"现在是第1个选项，索引为0
         self.data_src_Val = self.data_src_box.GetStringSelection()
         
         self.hbox_btt = wx.BoxSizer(wx.HORIZONTAL)
@@ -618,6 +692,7 @@ class ParamsConfigDialog(wx.Dialog):
             self.CtrlPanel, proportion=10, border=2, flag=wx.EXPAND | wx.ALL
         )
         self.SetSizer(self.HBoxPanel)
+        # 注意：不再默认选中tushare，所以不需要初始化检查
 
     def OnClickOpenAccunt(self, event, trade_plat):
         back_info = ""
@@ -737,9 +812,266 @@ class ParamsConfigDialog(wx.Dialog):
     def _ev_switch_menu(self, event):
         pass
 
+    def _ev_on_data_store_change(self, event):
+        """数据存储方式改变事件"""
+        selection = self.data_store_box.GetStringSelection()
+        
+        if selection == "本地csv":
+            # 弹出目录选择对话框
+            dlg = wx.DirDialog(self, "选择CSV数据存储目录", 
+                              style=wx.DD_DEFAULT_STYLE | wx.DD_DIR_MUST_EXIST)
+            if dlg.ShowModal() == wx.ID_OK:
+                selected_path = dlg.GetPath()
+                self.data_store_config["type"] = "csv"
+                self.data_store_config["path"] = selected_path
+                # 临时存储
+                _temp_storage["csv_path"] = selected_path
+                logger.info(f"CSV存储路径已设置: {selected_path}")
+                wx.MessageBox(f"CSV存储路径已设置:\n{selected_path}", "提示", wx.OK | wx.ICON_INFORMATION)
+            dlg.Destroy()
+            
+        elif selection == "postgresql":
+            # 使用CallAfter延迟弹出对话框，避免事件处理中的重入问题
+            wx.CallAfter(self._show_pg_config_dialog)
+
+    def _show_pg_config_dialog(self):
+        """显示PostgreSQL配置对话框"""
+        try:
+            pg_dlg = PostgreSQLConfigDialog(self, -1, "PostgreSQL数据库配置")
+            result = pg_dlg.ShowModal()
+            if result == wx.ID_OK:
+                config = pg_dlg.get_config()
+                pg_dlg.Destroy()
+                # 异步测试连接
+                self._test_pg_connection_with_busy(config)
+            else:
+                pg_dlg.Destroy()
+        except Exception as e:
+            logger.error(f"显示PostgreSQL配置对话框失败: {e}")
+            wx.MessageBox(f"打开配置对话框失败: {str(e)}", "错误", wx.OK | wx.ICON_ERROR)
+
+    def _test_pg_connection_with_busy(self, config):
+        """带进度提示的PostgreSQL连接测试"""
+        # 创建进度对话框
+        self._pg_progress = wx.ProgressDialog(
+            "连接测试",
+            "正在连接PostgreSQL数据库，请稍候...",
+            maximum=100,
+            parent=self,
+            style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE
+        )
+        self._pg_progress.Update(0)
+        
+        # 使用定时器来执行连接测试，避免阻塞
+        def do_test():
+            try:
+                success, error_msg = self._test_postgresql_connection(config)
+                wx.CallAfter(self._on_pg_test_complete, success, config, error_msg)
+            except Exception as e:
+                logger.error(f"PostgreSQL连接测试异常: {e}")
+                wx.CallAfter(self._on_pg_test_complete, False, config, str(e))
+        
+        import threading
+        thread = threading.Thread(target=do_test, daemon=True)
+        thread.start()
+
+    def _on_pg_test_complete(self, success, config, error_msg=None):
+        """PostgreSQL连接测试完成回调"""
+        if hasattr(self, '_pg_progress') and self._pg_progress:
+            self._pg_progress.Update(100)
+            self._pg_progress.Destroy()
+            self._pg_progress = None
+        
+        if success:
+            self.data_store_config["type"] = "postgresql"
+            self.data_store_config["config"] = config
+            # 临时存储密码，其他存入配置
+            _temp_storage["postgresql_config"] = config
+            logger.info(f"PostgreSQL配置已设置: {config['host']}/{config['database']}")
+            wx.MessageBox("PostgreSQL连接成功!\n查询测试通过。", "提示", wx.OK | wx.ICON_INFORMATION)
+        else:
+            if error_msg:
+                wx.MessageBox(f"PostgreSQL连接失败:\n{error_msg}", "错误", wx.OK | wx.ICON_ERROR)
+            else:
+                wx.MessageBox("PostgreSQL连接失败，请检查配置!\n\n请确认:\n1. 数据库服务已启动\n2. 网络连接正常\n3. 用户名密码正确\n4. 数据库和表名存在", "错误", wx.OK | wx.ICON_ERROR)
+
+    def _ev_on_data_src_change(self, event):
+        """数据源选择改变事件"""
+        global _processing_tushare
+        
+        # 防止递归调用
+        if _processing_tushare:
+            logger.info("正在处理tushare，跳过递归调用")
+            return
+        
+        try:
+            selection = self.data_src_box.GetStringSelection()
+            logger.info(f"数据源选择改变: {selection}")
+            self.data_src_Val = selection
+            
+            if selection == "tushare":
+                logger.info("检测到tushare选择，准备显示API Key输入对话框")
+                _processing_tushare = True
+                self._show_tushare_dialog()
+            else:
+                # 切换到非tushare时，清除API key
+                _temp_storage["tushare_api_key"] = None
+                # 删除临时token文件
+                temp_token_file = os.path.join(QBOT_TOP_PATH, "qbot", "common", "configs", "temp_tushare_token.txt")
+                try:
+                    if os.path.exists(temp_token_file):
+                        os.remove(temp_token_file)
+                        logger.info("Tushare API Key 临时文件已删除（切换数据源时）")
+                except Exception as e:
+                    logger.warning(f"删除临时token文件失败: {e}")
+        except Exception as e:
+            logger.error(f"数据源选择改变事件处理异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            _processing_tushare = False
+            wx.MessageBox(f"处理数据源选择事件时出错:\n{str(e)}", "错误", wx.OK | wx.ICON_ERROR)
+    
+    def _show_tushare_dialog(self):
+        """显示Tushare API Key输入对话框"""
+        global _processing_tushare
+        
+        logger.info("显示Tushare API Key输入对话框")
+        
+        try:
+            # 检查是否已经设置过
+            if _temp_storage.get("tushare_api_key"):
+                logger.info("API Key已设置，询问是否重新输入")
+                dlg = wx.MessageDialog(self, 
+                    "Tushare API Key 已设置，是否重新输入?", 
+                    "确认", 
+                    wx.YES_NO | wx.ICON_QUESTION)
+                result = dlg.ShowModal()
+                dlg.Destroy()
+                if result != wx.ID_YES:
+                    logger.info("用户选择不重新输入")
+                    _processing_tushare = False
+                    return
+            
+            dlg = wx.TextEntryDialog(self, "请输入Tushare API Key:", "Tushare登录")
+            dlg.SetValue(_temp_storage.get("tushare_api_key") or "")
+            
+            result = dlg.ShowModal()
+            logger.info(f"对话框返回结果: {result}")
+            
+            if result == wx.ID_OK:
+                api_key = dlg.GetValue().strip()
+                logger.info(f"用户输入API Key长度: {len(api_key)}")
+                if api_key:
+                    _temp_storage["tushare_api_key"] = api_key
+                    temp_token_file = os.path.join(QBOT_TOP_PATH, "qbot", "common", "configs", "temp_tushare_token.txt")
+                    try:
+                        with open(temp_token_file, "w", encoding="utf-8") as f:
+                            f.write(api_key)
+                        logger.info("Tushare API Key 已保存到临时文件")
+                    except Exception as e:
+                        logger.warning(f"保存临时token失败: {e}")
+                    wx.MessageBox("Tushare API Key 已设置!\n注意：程序关闭后需重新输入。", "提示", wx.OK | wx.ICON_INFORMATION)
+                else:
+                    wx.MessageBox("API Key 不能为空!", "警告", wx.OK | wx.ICON_WARNING)
+                    self.data_src_box.SetSelection(0)
+                    self.data_src_Val = "离线csv"
+            else:
+                logger.info("用户取消输入，切换回离线csv")
+                self.data_src_box.SetSelection(0)
+                self.data_src_Val = "离线csv"
+            
+            dlg.Destroy()
+        except Exception as e:
+            logger.error(f"显示Tushare对话框时发生异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            wx.MessageBox(f"显示API Key输入框时出错:\n{str(e)}", "错误", wx.OK | wx.ICON_ERROR)
+        finally:
+            _processing_tushare = False
+
+    def _test_postgresql_connection(self, config):
+        """测试PostgreSQL连接并执行查询，返回 (success: bool, error_msg: str)"""
+        import socket
+        
+        # 先测试网络连通性
+        try:
+            port = int(config.get('port', 5432))
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(3)  # 3秒超时
+            result = sock.connect_ex((config['host'], port))
+            sock.close()
+            if result != 0:
+                return False, f"无法连接到 {config['host']}:{port}，请检查网络或防火墙设置"
+        except Exception as e:
+            logger.warning(f"网络连通性测试失败: {e}")
+            # 继续尝试数据库连接，不因此中断
+        
+        try:
+            import psycopg2
+            # 连接数据库，使用较短的超时
+            conn = psycopg2.connect(
+                host=config['host'],
+                user=config['user'],
+                password=config['password'],
+                dbname=config['database'],
+                port=int(config.get('port', 5432)),
+                connect_timeout=5,  # 连接超时5秒
+                options='-c statement_timeout=5000'  # 查询超时5秒
+            )
+            
+            # 执行查询 - 使用schema.table格式更安全
+            with conn.cursor() as cursor:
+                table = config['table']
+                # 检查表是否存在
+                cursor.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = %s
+                    );
+                """, (table,))
+                table_exists = cursor.fetchone()[0]
+                
+                if not table_exists:
+                    logger.warning(f"表 '{table}' 不存在，但连接成功")
+                else:
+                    # 尝试查询表结构 - 使用 库.表 格式
+                    database = config['database']
+                    cursor.execute(f"SELECT * FROM {database}.{table} LIMIT 1")
+                    result = cursor.fetchone()
+                    logger.info(f"PostgreSQL查询成功，表: {database}.{table}")
+            
+            conn.close()
+            return True, None
+        except ImportError:
+            logger.error("未安装psycopg2，请执行: pip install psycopg2-binary")
+            return False, "未安装psycopg2模块!\n请执行: pip install psycopg2-binary"
+        except psycopg2.OperationalError as e:
+            error_msg = str(e)
+            logger.error(f"PostgreSQL连接失败: {error_msg}")
+            # 提供更友好的错误提示
+            if "Connection refused" in error_msg:
+                return False, f"连接被拒绝:\n数据库服务器 {config['host']}:{config.get('port', 5432)} 未启动或拒绝连接。\n请检查:\n1. PostgreSQL服务是否已启动\n2. 防火墙是否允许连接\n3. pg_hba.conf 配置是否正确"
+            elif "password authentication" in error_msg:
+                return False, "用户名或密码错误，请检查后重试。"
+            elif "database" in error_msg and "does not exist" in error_msg:
+                return False, f"数据库 '{config['database']}' 不存在，请先创建数据库。"
+            elif "timeout" in error_msg.lower():
+                return False, "连接超时:\n无法在指定时间内连接到数据库服务器。\n请检查:\n1. 网络连接是否正常\n2. 服务器地址和端口是否正确\n3. 服务器是否可访问"
+            else:
+                return False, f"连接错误: {error_msg}"
+        except Exception as e:
+            logger.error(f"PostgreSQL连接失败: {str(e)}")
+            return False, f"连接异常: {str(e)}"
+
     def _ev_save_para(self, event):
 
         self.sys_para["operate_sys"] = self.sel_operate_cmbo.GetStringSelection()
+        # 保存数据存储配置
+        if hasattr(self, 'data_store_config') and self.data_store_config:
+            self.sys_para["data_store_config"] = self.data_store_config
+        # 保存数据源配置（不含敏感信息）
+        self.sys_para["data_source"] = self.data_src_box.GetStringSelection()
+        
         Base_File_Oper.save_sys_para("sys_para.json", self.sys_para)
         MessageDialog("存储完成！")
         self.Close()
@@ -769,5 +1101,4 @@ class ParamsConfigDialog(wx.Dialog):
                     self.back_para["layout_dict"][v[0]] = float(event.GetString())
                     break
             Base_File_Oper.save_sys_para("back_para.json", self.back_para)
-        MessageDialog("存储完成！")
 

@@ -1,7 +1,27 @@
 {
     "__version__": "V1.3.8",
     "__author__": "Charmve",
-    "operate_sys": "macos",
+    "operate_sys": "windows",
+    "data_store_config": {
+        "type": "postgresql",
+        "path": "",
+        "config": {
+            "host": "117.50.199.19",
+            "port": "5432",
+            "database": "stg",
+            "user": "etl",
+            "password": "Etl_s3nTer",
+            "table": "daily_basic"
+        }
+    },
+    "postgresql_config": {
+        "host": "localhost",
+        "port": "5432",
+        "database": "",
+        "user": "postgres",
+        "table": "stock_data"
+    },
+    "data_source": "tushare",
     "multi-panels": {
         "mpl_fig_x": 5,
         "mpl_fig_y": 4,
